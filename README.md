@@ -10,6 +10,8 @@ hugodesk
 → HugoDesk  http://127.0.0.1:8765   (opens automatically)
 ```
 
+![HugoDesk dashboard](docs/screenshot-dashboard.png)
+
 ## Why HugoDesk
 
 - **Single binary, zero dependencies.** The UI, templates and CSS are embedded
