@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -179,6 +180,10 @@ func readFM(src string) (fm map[string]string, order []string, body string,
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
+		if trimmed == ":" || strings.HasPrefix(trimmed, ": ") {
+			// blank/empty key line — drop it, preserving it breaks YAML
+			continue
+		}
 		if pending != nil {
 			pending = append(pending, ln)
 			joined := strings.Join(pending, " ")
@@ -266,6 +271,9 @@ func buildFM(p *Post) string {
 	}
 	fmt.Fprintf(&b, "draft: %t\n", p.Draft)
 	for _, kv := range p.Extras {
+		if kv[0] == "" {
+			continue
+		}
 		fmt.Fprintf(&b, "%s: %s\n", kv[0], kv[1])
 	}
 	b.WriteString("---\n")
@@ -814,6 +822,108 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// ------------------------------------------------------------- image upload
+
+var assetExt = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
+	".webp": true, ".svg": true, ".avif": true,
+}
+
+func uploadJSON(w http.ResponseWriter, code int, m map[string]string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(m)
+}
+
+// safeAssetPath is like safePath but allows directories under static/.
+func safeAssetPath(rel string) error {
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	clean := filepath.Clean(abs)
+	rp, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(clean, rp+string(os.PathSeparator)) && clean != rp {
+		return errors.New("path outside site root")
+	}
+	if !strings.HasPrefix(clean+string(os.PathSeparator),
+		filepath.Join(rp, "static")+string(os.PathSeparator)) {
+		return errors.New("only files under static/ can be written")
+	}
+	return nil
+}
+
+func freeAsset(dir, base, ext string) string {
+	if base == "" {
+		base = "image"
+	}
+	cand := base
+	for i := 2; ; i++ {
+		rel := dir + "/" + cand + ext
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); os.IsNotExist(err) {
+			return rel
+		}
+		cand = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
+		uploadJSON(w, 413, map[string]string{"error": "image too large (max 32 MB)"})
+		return
+	}
+	file, hdr, err := r.FormFile("file")
+	if err != nil {
+		uploadJSON(w, 400, map[string]string{"error": "no file sent"})
+		return
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(hdr.Filename))
+	if !assetExt[strings.TrimPrefix(ext, ".")] && !assetExt[ext] {
+		uploadJSON(w, 400, map[string]string{
+			"error": "unsupported file type (allowed: jpg, png, gif, webp, svg, avif)"})
+		return
+	}
+
+	// verify the payload really is an image
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(file, head)
+	head = head[:n]
+	if n > 0 && !strings.HasPrefix(http.DetectContentType(head), "image/") {
+		uploadJSON(w, 400, map[string]string{"error": "file is not an image"})
+		return
+	}
+
+	base := slugify(strings.TrimSuffix(hdr.Filename, filepath.Ext(hdr.Filename)))
+	rel := freeAsset("static/images", base, ext)
+	if err := safeAssetPath(rel); err != nil {
+		uploadJSON(w, 403, map[string]string{"error": err.Error()})
+		return
+	}
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		uploadJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	dst, err := os.Create(abs)
+	if err != nil {
+		uploadJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if _, err := io.Copy(dst, io.MultiReader(strings.NewReader(string(head)), file)); err != nil {		dst.Close()
+		uploadJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := dst.Close(); err != nil {
+		uploadJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	uploadJSON(w, 200, map[string]string{
+		"url": "/" + strings.TrimPrefix(rel, "static/")})
+}
+
 // ------------------------------------------------------------- templates
 
 const css = `
@@ -844,6 +954,14 @@ a.plain:hover{color:var(--muted)}
 label.f{display:block;font-family:system-ui,sans-serif;font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:.9rem 0 .3rem}
 input[type=text],input[type=date],select,textarea{width:100%;font-family:system-ui,sans-serif;font-size:.95rem;padding:.5rem .7rem;border:1px solid var(--line);border-radius:6px;background:#fff;color:#17130f}
 textarea.body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9rem;min-height:26rem;line-height:1.55;resize:vertical}
+.bodyhead{display:flex;justify-content:space-between;align-items:center;margin:.9rem 0 .3rem}
+.imgbtn{font-family:system-ui,sans-serif;font-size:.78rem;border:1px solid var(--line);background:none;border-radius:4px;padding:.25rem .7rem;cursor:pointer;color:var(--ink)}
+.imgbtn:hover{border-color:var(--ink)}
+.imgstatus{font-size:.78rem;margin-left:.5rem}
+.imgstatus.busy{color:var(--muted)}
+.imgstatus.ok{color:#2f6f3e}
+.imgstatus.err{color:#b3261e}
+textarea.body.drag{outline:2px dashed var(--muted);outline-offset:-4px}
 .row3{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
 .check{display:flex;align-items:center;gap:.5rem;margin-top:1.2rem;font-family:system-ui,sans-serif;font-size:.9rem}
 .check input{width:auto}
@@ -959,7 +1077,14 @@ const editorInner = `
       <label class="f">Summary</label>
       <textarea name="summary" rows="2">{{.P.Summary}}</textarea>
 
-      <label class="f">Body (Markdown)</label>
+      <div class="bodyhead">
+        <label class="f" style="margin:0">Body (Markdown)</label>
+        <span class="ui imgarea">
+          <button type="button" class="imgbtn" onclick="document.getElementById('imgfile').click()">&#128247; Upload image</button>
+          <input type="file" id="imgfile" accept="image/*" style="display:none">
+          <span class="imgstatus" id="imgstatus"></span>
+        </span>
+      </div>
       <textarea class="body" name="body" id="body" oninput="pv()">{{.P.Body}}</textarea>
 
       <div class="check"><input type="checkbox" name="draft" id="draft" {{if .P.Draft}}checked{{end}}><label for="draft">Draft (checked = not published)</label></div>
@@ -985,7 +1110,7 @@ function pv(){
 }
 function md(src){
   var out=[];var lines=esc(src).split('\n');var i=0;
-  function inline(s){return s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<em>$1</em>').replace(/\u0060([^\u0060]+)\u0060/g,'<code>$1</code>').replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2">$1</a>')}
+  function inline(s){return s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g,'<img src="$2" alt="$1">').replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<em>$1</em>').replace(/\u0060([^\u0060]+)\u0060/g,'<code>$1</code>').replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2">$1</a>')}
   while(i<lines.length){
     var l=lines[i];
     if(l.startsWith('\u0060\u0060\u0060')){var buf=[];i++;while(i<lines.length&&!lines[i].startsWith('\u0060\u0060\u0060')){buf.push(lines[i]);i++}i++;out.push('<pre><code>'+buf.join('\n')+'</code></pre>');continue}
@@ -1016,6 +1141,47 @@ function mdCells(row){
   return row.split('|').map(function(c){return c.trim()})
 }
 pv();
+var bodyEl=document.getElementById('body');
+function insertAtCursor(text){
+  var s=bodyEl.selectionStart||0,e=bodyEl.selectionEnd||0;
+  bodyEl.value=bodyEl.value.slice(0,s)+text+bodyEl.value.slice(e);
+  bodyEl.selectionStart=bodyEl.selectionEnd=s+text.length;
+  bodyEl.focus();pv();
+}
+function upImg(file){
+  if(!file)return;
+  var st=document.getElementById('imgstatus');
+  st.textContent='Uploading \u201c'+file.name+'\u201d\u2026';st.className='imgstatus busy';
+  var fd=new FormData();fd.append('file',file);
+  fetch('/upload',{method:'POST',body:fd}).then(function(r){return r.json()}).then(function(d){
+    if(d.url){
+      var alt=(file.name||'image').replace(/\.[^.]+$/,'');
+      insertAtCursor('!['+alt+']('+d.url+') ');st.textContent='';st.className='imgstatus ok';
+    }else{
+      st.textContent=d.error||'upload failed';st.className='imgstatus err';
+    }
+  }).catch(function(){st.textContent='upload failed';st.className='imgstatus err'});
+  setTimeout(function(){st.textContent='';st.className='imgstatus'},4000);
+}
+document.getElementById('imgfile').addEventListener('change',function(){upImg(this.files[0]);this.value=''});
+bodyEl.addEventListener('dragover',function(e){e.preventDefault();bodyEl.classList.add('drag')});
+bodyEl.addEventListener('dragleave',function(){bodyEl.classList.remove('drag')});
+bodyEl.addEventListener('drop',function(e){
+  e.preventDefault();bodyEl.classList.remove('drag');
+  var f=e.dataTransfer.files&&e.dataTransfer.files[0];
+  if(f&&/^image\//.test(f.type)){upImg(f)}
+});
+bodyEl.addEventListener('paste',function(e){
+  var items=e.clipboardData&&e.clipboardData.items;
+  if(!items)return;
+  for(var i=0;i<items.length;i++){
+    if(/^image\//.test(items[i].type)){
+      var f=items[i].getAsFile();
+      if(f){f.name=f.name||'pasted.png';upImg(f);e.preventDefault()}
+      break;
+    }
+  }
+});
 </script>`
 
 const errInner = `
@@ -1101,6 +1267,9 @@ func main() {
 	mux.HandleFunc("/delete", handleDelete)
 	mux.HandleFunc("/preview", handlePreview)
 	mux.HandleFunc("/stop", handleStop)
+	mux.HandleFunc("/upload", handleUpload)
+	imgFs := http.FileServer(http.Dir(filepath.Join(root, "static", "images")))
+	mux.Handle("/images/", http.StripPrefix("/images/", imgFs))
 
 	u := "http://" + addr
 	fmt.Println("HugoDesk  " + u)

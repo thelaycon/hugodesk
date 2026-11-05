@@ -32,7 +32,8 @@ hugodesk
 | Dashboard | All content files grouped by section, with title, date and DRAFT/PUBLISHED badges |
 | Create posts | Section picker, title, date, categories, tags, summary and Markdown body; slug auto-derived from the title (collision-safe) |
 | Editing | Two-pane editor: form on the left, **live Markdown preview** on the right |
-| Live preview | Renders headings, bold/italic, links, lists, blockquotes, fenced code and GFM tables |
+| Live preview | Renders headings, bold/italic, links, lists, blockquotes, fenced code, GFM tables and images |
+| Image upload | Pick, drag-and-drop or paste an image in the editor; it's saved to `static/images/` (collision-safe name) and inserted as Markdown at the cursor |
 | Draft control | Publish / Unpublish any post with one click |
 | Delete | With confirmation dialog |
 | Site preview | Spawns `hugo server` on a free port and opens it in a new tab: **Preview site** (published content only) and **Preview drafts** (includes `draft: true`) |
